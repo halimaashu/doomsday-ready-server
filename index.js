@@ -24,6 +24,31 @@ const movieSchema = new mongoose.Schema(
 const Movie = mongoose.model("Movie", movieSchema);
 
 // ---------- Routes ----------
+// ---------- Circular check ----------
+// movieId-r prerequisite hishebe newPrereqIds dile loop hobe kina
+async function hasCircularDependency(movieId, newPrereqIds) {
+  const visited = new Set();
+  const stack = newPrereqIds.map(String);
+
+  while (stack.length > 0) {
+    const currentId = stack.pop();
+
+    if (currentId === String(movieId)) return true; // A peye gelam, loop
+    if (visited.has(currentId)) continue;
+    visited.add(currentId);
+
+    const movie = await Movie.findById(currentId);
+    if (movie) {
+      for (const preId of movie.prerequisites) {
+        stack.push(String(preId));
+      }
+    }
+  }
+
+  return false;
+}
+
+// simple check the api status 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -81,6 +106,65 @@ app.post("/api/movies", async (req, res) => {
 app.get("/api/movies", async (req, res) => {
   const movies = await Movie.find();
   res.json(movies);
+});
+
+// PATCH /api/movies/:id
+app.patch("/api/movies/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["invalid movie id"] });
+  }
+
+  const movie = await Movie.findById(id);
+  if (!movie) {
+    return res.status(404).json({ error: "NOT_FOUND", message: "Movie not found" });
+  }
+
+  const { title, releaseYear, runtime, prerequisites, watched } = req.body;
+
+  if (releaseYear !== undefined && !Number.isInteger(releaseYear)) {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["releaseYear must be a whole number"] });
+  }
+  if (runtime !== undefined && (!Number.isInteger(runtime) || runtime < 1 || runtime > 300)) {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["runtime must be a whole number from 1 to 300"] });
+  }
+  if (watched !== undefined && typeof watched !== "boolean") {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["watched must be true or false"] });
+  }
+
+  if (prerequisites !== undefined) {
+    if (!Array.isArray(prerequisites) || !prerequisites.every((p) => mongoose.isValidObjectId(p))) {
+      return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["prerequisites must be a list of valid movie ids"] });
+    }
+
+    // Circular check, save-er age
+    if (await hasCircularDependency(id, prerequisites)) {
+      return res.status(409).json({
+        error: "CIRCULAR_DEPENDENCY",
+        message: "This change would create a circular dependency",
+      });
+    }
+    movie.prerequisites = prerequisites;
+  }
+
+  if (title !== undefined) movie.title = title;
+  if (releaseYear !== undefined) movie.releaseYear = releaseYear;
+  if (runtime !== undefined) movie.runtime = runtime;
+  if (watched !== undefined) movie.watched = watched;
+
+  try {
+    await movie.save();
+    res.json(movie);
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ error: "DUPLICATE_TITLE", message: "Title already exists" });
+    }
+    if (err.name === "ValidationError") {
+      return res.status(400).json({ error: "VALIDATION_ERROR", messages: Object.values(err.errors).map((e) => e.message) });
+    }
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
 });
 
 // ---------- Start ----------
