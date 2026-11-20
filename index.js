@@ -21,11 +21,68 @@ const movieSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const cinemaSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, unique: true, trim: true },
+    bundleSizes: { type: [Number], required: true },
+  },
+  { timestamps: true }
+);
+
+const Cinema = mongoose.model("Cinema", cinemaSchema);
+
 const Movie = mongoose.model("Movie", movieSchema);
 
 // ---------- Routes ----------
 // ---------- Circular check ----------
+
+// ---------- Cinema validation ----------
+function validateBundleSizes(sizes) {
+  if (!Array.isArray(sizes)) return "bundleSizes must be a list";
+  if (sizes.length < 1 || sizes.length > 10) return "bundleSizes must have 1 to 10 sizes";
+  if (!sizes.every((s) => Number.isInteger(s) && s >= 1 && s <= 500)) {
+    return "each bundle size must be a whole number from 1 to 500";
+  }
+  if (new Set(sizes).size !== sizes.length) return "bundle sizes must be different from each other";
+  return null;
+}
+
+// ---------- Booking quote ----------
+function bundleQuote(sizes, groupSize) {
+  const best = new Array(groupSize + 1).fill(Infinity);
+  const used = new Array(groupSize + 1).fill(0);
+  best[0] = 0;
+
+  for (let n = 1; n <= groupSize; n++) {
+    for (const s of sizes) {
+      if (s <= n && best[n - s] + 1 < best[n]) {
+        best[n] = best[n - s] + 1;
+        used[n] = s;
+      }
+    }
+  }
+
+  if (best[groupSize] === Infinity) return null; // not possible
+
+  // Kon size koyta, seta ber kori
+  const counts = {};
+  let n = groupSize;
+  while (n > 0) {
+    const s = used[n];
+    counts[s] = (counts[s] || 0) + 1;
+    n -= s;
+  }
+
+  const bundles = Object.keys(counts)
+    .map(Number)
+    .sort((a, b) => b - a)
+    .map((size) => ({ size, count: counts[size] }));
+
+  return { totalBundles: best[groupSize], bundles };
+}
+
 // movieId-r prerequisite hishebe newPrereqIds dile loop hobe kina
+
 async function hasCircularDependency(movieId, newPrereqIds) {
   const visited = new Set();
   const stack = newPrereqIds.map(String);
@@ -166,6 +223,140 @@ app.patch("/api/movies/:id", async (req, res) => {
     res.status(500).json({ error: "SERVER_ERROR" });
   }
 });
+
+// GET /api/movies/:id/rewatch-order
+app.get("/api/movies/:id/rewatch-order", async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["invalid movie id"] });
+  }
+
+  const allMovies = await Movie.find();
+  const moviesById = {};
+  for (const m of allMovies) {
+    moviesById[String(m._id)] = m;
+  }
+
+  const target = moviesById[id];
+  if (!target) {
+    return res.status(404).json({ error: "NOT_FOUND", message: "Movie not found" });
+  }
+
+  const visited = new Set();
+  const result = [];
+
+  function visit(movieId) {
+    if (visited.has(movieId)) return;
+    visited.add(movieId);
+
+    const movie = moviesById[movieId];
+    if (!movie) return;
+
+    for (const preId of movie.prerequisites) {
+      visit(String(preId));
+    }
+
+    result.push(movie);
+  }
+
+  // Target-er prerequisite-gulo visit kori, target nijeke na
+  visited.add(id);
+  for (const preId of target.prerequisites) {
+    visit(String(preId));
+  }
+
+  const watchedCount = result.filter((m) => m.watched).length;
+  const remainingRuntime = result
+    .filter((m) => !m.watched)
+    .reduce((sum, m) => sum + m.runtime, 0);
+
+  res.json({
+    target: { _id: target._id, title: target.title },
+    order: result,
+    totalCount: result.length,
+    watchedCount,
+    remainingRuntime,
+  });
+});
+
+
+// POST /api/cinemas (ekta object ba array)
+app.post("/api/cinemas", async (req, res) => {
+  const items = Array.isArray(req.body) ? req.body : [req.body];
+  const created = [];
+
+  for (const item of items) {
+    if (typeof item.name !== "string" || item.name.trim() === "") {
+      return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["name is required"] });
+    }
+
+    const sizeError = validateBundleSizes(item.bundleSizes);
+    if (sizeError) {
+      return res.status(400).json({ error: "VALIDATION_ERROR", messages: [sizeError] });
+    }
+
+    try {
+      const cinema = await Cinema.create({ name: item.name, bundleSizes: item.bundleSizes });
+      created.push(cinema);
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(409).json({ error: "DUPLICATE_NAME", message: `${item.name} already exists` });
+      }
+      return res.status(500).json({ error: "SERVER_ERROR" });
+    }
+  }
+
+  res.status(201).json(Array.isArray(req.body) ? created : created[0]);
+});
+
+// GET /api/cinemas
+app.get("/api/cinemas", async (req, res) => {
+  const cinemas = await Cinema.find();
+  res.json(cinemas);
+});
+
+// GET /api/cinemas/:id/booking?groupSize=6
+app.get("/api/cinemas/:id/booking", async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(400).json({ error: "VALIDATION_ERROR", messages: ["invalid cinema id"] });
+  }
+
+  const groupSize = Number(req.query.groupSize);
+  if (!Number.isInteger(groupSize) || groupSize < 1 || groupSize > 10000) {
+    return res.status(400).json({
+      error: "VALIDATION_ERROR",
+      messages: ["groupSize must be a whole number from 1 to 10000"],
+    });
+  }
+
+  const cinema = await Cinema.findById(id);
+  if (!cinema) {
+    return res.status(404).json({ error: "NOT_FOUND", message: "Cinema not found" });
+  }
+
+  const quote = bundleQuote(cinema.bundleSizes, groupSize);
+
+  if (!quote) {
+    return res.json({
+      cinema: cinema.name,
+      groupSize,
+      possible: false,
+      message: "Not possible",
+    });
+  }
+
+  res.json({
+    cinema: cinema.name,
+    groupSize,
+    possible: true,
+    totalBundles: quote.totalBundles,
+    bundles: quote.bundles,
+  });
+});
+
 
 // ---------- Start ----------
 mongoose
